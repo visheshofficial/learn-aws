@@ -1,0 +1,13 @@
+version: 2
+
+models:
+  - name: fct_customer_orders
+    description: "One row per customer with lifetime order aggregates. By this layer both sides have already been staged into Glue-backed tables, so this join no longer touches the Lambda connectors."
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: total_spent
+        tests:
+          - not_null

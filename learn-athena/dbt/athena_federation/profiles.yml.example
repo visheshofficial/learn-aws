@@ -1,0 +1,19 @@
+# Reference only — the real file dbt reads lives at ~/.dbt/profiles.yml, not in this repo,
+# since it's local environment config (bucket names, AWS profile) rather than project code.
+# The setup phase in athena-manual-connector-deployment.md generates the real one for you
+# by substituting these placeholders with your actual $RESULTS_BUCKET / $AWS_REGION / $AWS_PROFILE.
+
+athena_federation:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      s3_staging_dir: "s3://REPLACE_WITH_RESULTS_BUCKET/dbt-staging/"
+      s3_data_dir: "s3://REPLACE_WITH_RESULTS_BUCKET/dbt-models/"
+      s3_data_naming: schema_table
+      region_name: us-east-1
+      schema: dbt_athena_federation
+      database: awsdatacatalog
+      aws_profile_name: REPLACE_WITH_YOUR_AWS_PROFILE
+      threads: 2
+      num_retries: 3

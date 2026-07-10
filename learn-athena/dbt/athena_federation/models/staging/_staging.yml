@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: "Synthetic customer records sourced live from DynamoDB via the Athena Lambda connector, materialized once here so downstream models/tests don't repeatedly re-invoke the connector."
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: name
+        tests:
+          - not_null
+      - name: email
+        tests:
+          - not_null
+
+  - name: stg_orders
+    description: "Synthetic order records sourced live from RDS MySQL via the Athena Lambda connector."
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: product
+        tests:
+          - not_null
+      - name: amount
+        tests:
+          - not_null
+      - name: order_date
+        tests:
+          - not_null

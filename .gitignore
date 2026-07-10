@@ -1,0 +1,9 @@
+.DS_Store
+.venv/
+*.jar
+
+# Scratch working directory created while running the commands in
+# learn-athena/athena-manual-connector-deployment.md — contains real,
+# account-specific infra details (account ID, live RDS endpoint), not
+# reusable project content. Delete it once your resources are torn down.
+/athena-federation-demo/

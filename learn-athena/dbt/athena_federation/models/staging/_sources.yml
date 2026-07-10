@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: dynamodb_catalog
+    description: "DynamoDB, reached live through the Athena Lambda federation connector — not a Glue-backed table."
+    database: dynamodb_catalog
+    schema: default
+    tables:
+      - name: customers
+
+  - name: mysql_catalog
+    description: "RDS MySQL, reached live through the Athena Lambda federation connector — not a Glue-backed table."
+    database: mysql_catalog
+    schema: federation_demo
+    tables:
+      - name: orders
