@@ -12,7 +12,7 @@ These were confirmed with you before writing any commands — change them if you
 |---|---|
 | Region | `us-east-1` |
 | MySQL hosting | New RDS MySQL instance, **VPC-private** (no public access in steady state) |
-| Redshift hosting | New **single-node `dc2.large`** provisioned cluster, **VPC-private**. Not Redshift Serverless — in `us-east-1` Serverless has an 8-RPU minimum (~$3/hour active), while a single-node `dc2.large` is $0.25/hour flat with storage included, and may be free under AWS's 2-month Redshift free trial (750 `dc2.large` hours/month) if this account hasn't used one before |
+| Redshift hosting | New **single-node `ra3.large`** provisioned cluster, **VPC-private**. `dc2.large` is not an option — DC2 node types were discontinued for new cluster creation on 2025-05-15 and retire entirely on 2026-04-24, so `ra3.large` (the smallest RA3 size) is now the cheapest orderable node. Still cheaper than Redshift Serverless for a short POC: $0.543/hour compute + $0.024/GB-month storage (billed separately, unlike DC2's bundled local SSD) vs. Serverless's 8-RPU minimum (~$3/hour active) in `us-east-1` |
 | VPC | Your account's existing **default VPC** — Redshift reuses the same VPC, subnets, and Secrets Manager/S3 endpoints the MySQL connector already needed, rather than standing up its own |
 | Seed-data access to private RDS/Redshift | Temporarily open to your own IP + flip `publicly-accessible` on, load data, then revert both |
 | Data model | DynamoDB table `customers` (PK `customer_id`) ⋈ MySQL table `orders` (`customer_id` FK) ⋈ Redshift table `payments` (`order_id` FK) — a three-source chain joined on `customer_id` then `order_id` |
@@ -757,7 +757,7 @@ aws ec2 authorize-security-group-ingress \
 
 ### 5.3 Create the Redshift cluster (private, single-node)
 
-A single-node `dc2.large` is the cheapest predictable option for a short-lived POC — $0.25/hour flat, storage included, no separate RPU-style minimum the way Redshift Serverless has (8 RPU minimum in `us-east-1`, ~$3/hour active). Check your account for Redshift's 2-month free-trial banner before creating this — if eligible, this costs nothing.
+A single-node `ra3.large` is the cheapest node Redshift will actually let you provision today — DC2 (`dc2.large`/`dc2.8xlarge`) was discontinued for new clusters on 2025-05-15, so it's not a matter of picking a smaller size; RA3 is the only family available. `ra3.large` runs $0.543/hour compute plus $0.024/GB-month for storage (billed separately from compute — RA3 uses managed storage, not bundled local SSD), still well under Redshift Serverless's 8-RPU minimum (~$3/hour active in `us-east-1`) for a short POC. For a few dozen synthetic rows over a couple of test hours, expect roughly $1-2 total, storage cost negligible.
 
 ```bash
 export REDSHIFT_MASTER_PASSWORD="Aa1$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)"
@@ -769,7 +769,7 @@ echo "Redshift master password (save this — you'll need it to seed data): $RED
 ```bash
 aws redshift create-cluster \
   --cluster-identifier $REDSHIFT_CLUSTER_ID \
-  --node-type dc2.large \
+  --node-type ra3.large \
   --cluster-type single-node \
   --master-username $REDSHIFT_MASTER_USERNAME \
   --master-user-password "$REDSHIFT_MASTER_PASSWORD" \
