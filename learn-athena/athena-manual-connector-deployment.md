@@ -1,6 +1,6 @@
 # Athena Federated Queries: DynamoDB + MySQL + Redshift (Manual Deployment, No SAR)
 
-This guide deploys three Athena Query Federation connectors **manually** (uploading the pre-built connector `.jar` straight to Lambda — no SAR, no CloudFormation), seeds each data source with synthetic data, and runs federated queries that join across them. Every command is exact and runnable in order. The final section tears down every resource created.
+This guide deploys three Athena Query Federation connectors **manually** — no SAR, no CloudFormation — seeds each data source with synthetic data, and runs federated queries that join across them. Every command is exact and runnable in order. The final section tears down every resource created. Two connectors (DynamoDB, MySQL) deploy from the pre-built jar uploaded straight to Lambda; the third (Redshift) deploys from AWS's pre-built container image instead, because its jar exceeds Lambda's zip-deployment size limit — Phase 5.7 explains why.
 
 Connector version used throughout: **v2026.24.1** — asset filenames and required handler classes/env vars below were verified directly against the [aws-athena-query-federation](https://github.com/awslabs/aws-athena-query-federation) source at that tag (not assumed from older docs).
 
@@ -69,11 +69,11 @@ export LAMBDA_SG_NAME="athena-mysql-lambda-sg"
 export RDS_SG_NAME="athena-mysql-rds-sg"
 export ENDPOINT_SG_NAME="athena-secretsmanager-endpoint-sg"
 
-# Redshift connector
+# Redshift connector — deployed from a container image, not a jar (see Phase 5.7:
+# the jar exceeds Lambda's unzipped size limit), so no REDSHIFT_JAR variable here.
 export REDSHIFT_LAMBDA="athena_redshift_connector"
 export REDSHIFT_CATALOG="redshift_catalog"
 export REDSHIFT_ROLE="AthenaRedshiftConnectorRole"
-export REDSHIFT_JAR="athena-redshift-2026.24.1.jar"
 export REDSHIFT_CLUSTER_ID="athena-federation-redshift"
 export REDSHIFT_DB_NAME="federation_demo"
 export REDSHIFT_MASTER_USERNAME="admin"
@@ -141,6 +141,8 @@ aws athena update-work-group \
 
 ## Phase 2: Download connector jars and upload to the code bucket
 
+Only DynamoDB and MySQL — Redshift's jar exceeds Lambda's unzipped size limit and is deployed from a pre-built container image instead (Phase 5.7 explains why and how).
+
 ```bash
 curl -L -o $DYNAMODB_JAR \
   https://github.com/awslabs/aws-athena-query-federation/releases/download/v2026.24.1/$DYNAMODB_JAR
@@ -148,15 +150,11 @@ curl -L -o $DYNAMODB_JAR \
 curl -L -o $MYSQL_JAR \
   https://github.com/awslabs/aws-athena-query-federation/releases/download/v2026.24.1/$MYSQL_JAR
 
-curl -L -o $REDSHIFT_JAR \
-  https://github.com/awslabs/aws-athena-query-federation/releases/download/v2026.24.1/$REDSHIFT_JAR
-
 aws s3 cp $DYNAMODB_JAR s3://$CODE_BUCKET/connectors/$DYNAMODB_JAR
 aws s3 cp $MYSQL_JAR s3://$CODE_BUCKET/connectors/$MYSQL_JAR
-aws s3 cp $REDSHIFT_JAR s3://$CODE_BUCKET/connectors/$REDSHIFT_JAR
 ```
 
-> All three jars are self-contained (Maven shade plugin bundles the JDBC driver / AWS SDK / federation SDK), so no separate dependency jar is needed — confirmed from `athena-mysql/pom.xml`'s and `athena-redshift/pom.xml`'s `maven-shade-plugin` config.
+> Both jars are self-contained (Maven shade plugin bundles the JDBC driver / AWS SDK / federation SDK), so no separate dependency jar is needed — confirmed from `athena-mysql/pom.xml`'s `maven-shade-plugin` config. Both are also well under Lambda's 250 MiB unzipped limit, but not by much: 245.5 MB (MySQL) and 239.2 MB (DynamoDB) uncompressed, against a 262.1 MB ceiling. Worth re-checking with `unzip -l` if you bump `connector_version` later — there's no guarantee a future release stays under.
 
 ---
 
@@ -708,7 +706,7 @@ aws athena create-data-catalog \
 
 ## Phase 5: Redshift source — cluster, data, connector, catalog
 
-Redshift's connector is built on the same `athena-jdbc` codebase as MySQL's — same handler shape (`RedshiftMuxCompositeHandler`, the Redshift analogue of `MySqlMuxCompositeHandler`), same `default` connection-string env var format, same Secrets Manager credential mechanism, same required `JAVA_TOOL_OPTIONS` fix. This phase reuses the VPC, subnets, S3 Gateway endpoint, and Secrets Manager Interface endpoint already created in Phase 4 — only new security groups are created.
+Redshift's connector is built on the same `athena-jdbc` codebase as MySQL's — same handler shape (`RedshiftMuxCompositeHandler`, the Redshift analogue of `MySqlMuxCompositeHandler`), same `default` connection-string env var format, same Secrets Manager credential mechanism, same required `JAVA_TOOL_OPTIONS` fix. This phase reuses the VPC, subnets, S3 Gateway endpoint, and Secrets Manager Interface endpoint already created in Phase 4 — only new security groups are created. One thing does not carry over from MySQL: the connector jar itself is too large for Lambda's zip-deployment size limit, so 5.7 deploys it from a container image instead — no separate jar download for Redshift in Phase 2.
 
 ### 5.1 Create the Redshift cluster subnet group
 
@@ -923,10 +921,26 @@ export REDSHIFT_ROLE_ARN=$(aws iam get-role --role-name $REDSHIFT_ROLE --query '
 
 ### 5.7 Create the Redshift connector Lambda function
 
+> **This one can't be deployed as a jar — checked, not assumed.** Lambda's zip-based deployment has a hard 250 MiB (262,144,000 byte) limit on the **unzipped** package size. Downloading `athena-redshift-2026.24.1.jar` and running `unzip -l` on it shows 275,595,798 bytes uncompressed — about 13.5 MB over the limit, regardless of upload method (S3 doesn't change this limit). For reference, MySQL's jar unzips to 245,459,306 bytes — only ~4.6 MB of headroom — and DynamoDB's to 239,233,463 bytes. None of these are comfortably under the limit; Redshift's simply tips over it. This is exactly why AWS's own current SAR template for this connector defaults to `PackageType: Image` rather than a zip upload (confirmed in `athena-redshift/athena-redshift.yaml`) — it's not a preference, the jar doesn't fit any other way.
+>
+> The fix: deploy from AWS's own pre-built container image instead of a jar. Still fully manual (no SAR, no CloudFormation, no Docker build on your end) — just a different `--code` artifact type on the same `create-function` call. AWS publishes one of these images per connector, per release, at a fixed, predictable repository path that any account can pull from.
+
 ```bash
-check_vars SUBNET_IDS REDSHIFT_LAMBDA_SG_ID REDSHIFT_ROLE_ARN CODE_BUCKET REDSHIFT_JAR REDSHIFT_ENDPOINT REDSHIFT_SECRET_NAME || return 1
+check_vars SUBNET_IDS REDSHIFT_LAMBDA_SG_ID REDSHIFT_ROLE_ARN REDSHIFT_ENDPOINT REDSHIFT_SECRET_NAME AWS_REGION || return 1
 
 export SUBNET_IDS_CSV=$(echo $SUBNET_IDS | tr ' ' ',')
+
+# Account that owns the public connector container images — AWS uses two
+# region-specific exceptions (Bahrain, Hong Kong); everywhere else, including
+# us-east-1, uses the same account. Mirrors the Fn::If logic in
+# athena-redshift.yaml rather than hardcoding one region's value.
+case "$AWS_REGION" in
+  me-south-1) CONNECTOR_ECR_ACCOUNT=084828588479 ;;
+  ap-east-1)  CONNECTOR_ECR_ACCOUNT=183295418215 ;;
+  *)          CONNECTOR_ECR_ACCOUNT=292517598671 ;;
+esac
+export REDSHIFT_IMAGE_URI="${CONNECTOR_ECR_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/athena-federation-repository-redshift:2026.24.1"
+echo "Image: $REDSHIFT_IMAGE_URI"
 
 cat > redshift-env.json <<EOF
 {
@@ -941,12 +955,21 @@ cat > redshift-env.json <<EOF
 EOF
 cat redshift-env.json   # sanity check: "default" should literally contain ${AthenaRedshiftFederationSecret}
 
+# Image package type has no --runtime/--handler (those are zip-only) — the
+# entry point is set via --image-config instead, using file:// for the same
+# reason --environment does: shorthand syntax mangles nested structures.
+cat > redshift-image-config.json <<'EOF'
+{
+  "Command": ["com.amazonaws.athena.connectors.redshift.RedshiftMuxCompositeHandler"]
+}
+EOF
+
 aws lambda create-function \
   --function-name $REDSHIFT_LAMBDA \
-  --runtime java21 \
+  --package-type Image \
   --role $REDSHIFT_ROLE_ARN \
-  --handler com.amazonaws.athena.connectors.redshift.RedshiftMuxCompositeHandler \
-  --code S3Bucket=$CODE_BUCKET,S3Key=connectors/$REDSHIFT_JAR \
+  --code ImageUri=$REDSHIFT_IMAGE_URI \
+  --image-config file://redshift-image-config.json \
   --memory-size 3008 \
   --timeout 900 \
   --vpc-config SubnetIds=$SUBNET_IDS_CSV,SecurityGroupIds=$REDSHIFT_LAMBDA_SG_ID \
@@ -954,6 +977,8 @@ aws lambda create-function \
 
 aws lambda wait function-active --function-name $REDSHIFT_LAMBDA
 ```
+
+> No change needed to the IAM role from 5.6 — image-pull permission is governed by the image repository's own resource policy (which AWS has already configured to allow any account to pull, since this is the same mechanism SAR itself relies on to deploy this connector into arbitrary customer accounts), not by anything on your execution role. The role still only governs what the function can do at runtime, which is unchanged.
 
 ### 5.8 Register the Redshift Athena Data Catalog
 
