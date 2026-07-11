@@ -1,0 +1,12 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Real tfvars files contain nothing secret in this design (tenant_id is the
+# only required input, everything else is derived/generated), but keep the
+# convention anyway — only .example files are meant to be committed.
+*.tfvars
+!*.tfvars.example
