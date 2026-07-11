@@ -999,6 +999,144 @@ aws lambda wait function-active --function-name $REDSHIFT_LAMBDA
 
 > No change needed to the IAM role from 5.6 — image-pull permission is governed by the image repository's own resource policy (which AWS has already configured to allow any account to pull, since this is the same mechanism SAR itself relies on to deploy this connector into arbitrary customer accounts), not by anything on your execution role. The role still only governs what the function can do at runtime, which is unchanged.
 
+### 5.7b Corporate variant: when AWS's ECR account is blocked (JFrog + Jenkins)
+
+Everything in 5.7 assumes your account can pull from AWS's ECR account `292517598671`. In a locked-down corporate environment that external registry is often blocked by egress policy or an SCP. Here's how to proceed without it.
+
+**First, the constraint that determines everything else: Lambda can only pull container images from Amazon ECR.** From the [Lambda docs](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html): *"build your image locally and upload it to an Amazon ECR repository... The Amazon ECR repository must be in the same AWS Region as the Lambda function."* Third-party registries are not supported. **JFrog cannot be the runtime registry** — no configuration makes that work. JFrog can be your source of truth and promotion gate, but the image must land in an ECR repo before Lambda can use it.
+
+So separate two things that both get called "ECR":
+
+| | What it is | Typically blocked? |
+|---|---|---|
+| `292517598671.dkr.ecr...` | **AWS's** account. Third-party. What 5.7 pulls from. | Often yes |
+| `<your-account>.dkr.ecr...` | **Your own** private ECR. | Almost never — it's where all your containers already live |
+
+You only need to eliminate the first. And you can eliminate it entirely, because the connector repo ships its own `Dockerfile` — you can build the image yourself and never contact AWS's registry:
+
+```dockerfile
+# athena-redshift/Dockerfile, from the connector repo at v2026.24.1
+ARG JAVA_VERSION=11
+FROM public.ecr.aws/lambda/java:${JAVA_VERSION}
+ARG JAVA_TOOL_OPTIONS=""
+ENV JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}
+COPY target/athena-redshift-2026.24.1.jar ${LAMBDA_TASK_ROOT}
+RUN jar xf athena-redshift-2026.24.1.jar
+```
+
+That's the whole thing: AWS's Lambda Java base image with the connector jar unpacked into it. Note the 250 MiB unzipped limit that forced us off the jar path **does not apply to container images** — Lambda allows up to 10 GB uncompressed — which is exactly why this route exists.
+
+**The pipeline.** Two inputs need to come from JFrog instead of the internet, and one output needs to reach ECR:
+
+```
+                    ┌──────────────────────────────────────┐
+  connector jar ───▶│                                      │
+  (GitHub release   │            JFrog                     │
+   or built from    │  (generic repo: jar                  │
+   source w/ Maven) │   remote docker repo: base image)    │
+                    │                                      │
+  base image ──────▶│  public.ecr.aws/lambda/java:21       │
+                    └───────────────┬──────────────────────┘
+                                    │
+                              Jenkins: docker build
+                                    │
+                    ┌───────────────▼──────────────────────┐
+                    │  JFrog Docker registry               │
+                    │  (source of truth, scan + promote)   │
+                    └───────────────┬──────────────────────┘
+                                    │  Jenkins: promote
+                    ┌───────────────▼──────────────────────┐
+                    │  <your-account>.dkr.ecr.<region>...  │  ◀── Lambda pulls from here
+                    └──────────────────────────────────────┘
+```
+
+**1. Get the jar into JFrog.** Either mirror the GitHub release asset into a JFrog generic repo, or build from source with JFrog as your Maven proxy (`mvn -pl athena-redshift -am package`). The former is simpler and is what the pre-built image uses anyway.
+
+**2. Get the base image into JFrog.** `public.ecr.aws/lambda/java:21` is on ECR **Public** (gallery.ecr.aws), which is a different service from the private ECR account in 5.7 and is frequently allowed even where the latter is not — worth checking before assuming you need a mirror. If it is blocked, a JFrog remote Docker repository proxying `public.ecr.aws` is the standard corporate answer.
+
+**3. Create your own private ECR repo** (once, in the account the Lambda lives in):
+
+```bash
+aws ecr create-repository \
+  --repository-name athena-federation/redshift \
+  --region $AWS_REGION \
+  --image-scanning-configuration scanOnPush=true
+```
+
+**4. Jenkins: build, push to JFrog, promote to ECR.** Sketch — adapt registry hostnames and credentials to your setup:
+
+```groovy
+pipeline {
+  agent { label 'docker' }
+  environment {
+    CONNECTOR_VERSION = '2026.24.1'
+    JFROG_DOCKER      = 'artifactory.corp.example.com/docker-local'
+    JFROG_GENERIC     = 'https://artifactory.corp.example.com/artifactory/generic-local'
+    AWS_REGION        = 'us-east-1'
+    AWS_ACCOUNT_ID    = '675934747669'
+    ECR_REPO          = 'athena-federation/redshift'
+  }
+  stages {
+    stage('Fetch jar from JFrog') {
+      steps {
+        sh '''
+          mkdir -p target
+          curl -fsSL -u "$JFROG_CREDS" \
+            "$JFROG_GENERIC/athena-federation/athena-redshift-${CONNECTOR_VERSION}.jar" \
+            -o "target/athena-redshift-${CONNECTOR_VERSION}.jar"
+        '''
+      }
+    }
+    stage('Build image') {
+      steps {
+        // JAVA_VERSION must be 21 — the Dockerfile defaults to 11.
+        // JAVA_TOOL_OPTIONS bakes in the Arrow --add-opens fix at build time;
+        // the Lambda env var in 5.7 sets it too, so this is belt-and-braces.
+        sh '''
+          docker build \
+            --build-arg JAVA_VERSION=21 \
+            --build-arg JAVA_TOOL_OPTIONS="--add-opens=java.base/java.nio=ALL-UNNAMED" \
+            -f athena-redshift/Dockerfile \
+            -t "${JFROG_DOCKER}/athena-federation-redshift:${CONNECTOR_VERSION}" \
+            .
+        '''
+      }
+    }
+    stage('Push to JFrog (source of truth)') {
+      steps {
+        sh 'docker push "${JFROG_DOCKER}/athena-federation-redshift:${CONNECTOR_VERSION}"'
+        // Scanning / promotion gates go here.
+      }
+    }
+    stage('Promote to ECR') {
+      steps {
+        sh '''
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin \
+              "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          docker tag  "${JFROG_DOCKER}/athena-federation-redshift:${CONNECTOR_VERSION}" \
+                      "${ECR_URI}:${CONNECTOR_VERSION}"
+          docker push "${ECR_URI}:${CONNECTOR_VERSION}"
+        '''
+      }
+    }
+  }
+}
+```
+
+**5. Point the Lambda at your own ECR** — the only change to 5.7's `create-function` is the image URI:
+
+```bash
+export REDSHIFT_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/athena-federation/redshift:2026.24.1"
+```
+
+Everything else in 5.7 (the `--image-config` entry point, env vars, VPC config, IAM role) is unchanged. And unlike the cross-account case, **same-account ECR needs no repository policy at all** — the docs are explicit that same-account access requires only one side to grant permission, and the function's execution role suffices.
+
+> **Do not delete the image from ECR after deploying.** Lambda re-fetches the image from ECR periodically (to re-optimize after a function goes idle), not just once at create time. If the image or its permissions disappear, the function enters the `Failed` state and *all invocations fail*. This bites people who treat the ECR push as a one-shot deployment step.
+
+**The same pattern applies to the DynamoDB and MySQL connectors**, incidentally — in a corporate setup their jars would come from JFrog rather than a `curl` to GitHub, then get uploaded to S3 exactly as in Phase 2. Only Redshift additionally needs the container route, because only Redshift's jar breaks the size limit.
+
 ### 5.8 Register the Redshift Athena Data Catalog
 
 ```bash
