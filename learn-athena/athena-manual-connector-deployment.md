@@ -941,7 +941,34 @@ case "$AWS_REGION" in
 esac
 export REDSHIFT_IMAGE_URI="${CONNECTOR_ECR_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/athena-federation-repository-redshift:2026.24.1"
 echo "Image: $REDSHIFT_IMAGE_URI"
+```
 
+`292517598671` is an **AWS-owned account, not yours** — this image is never copied or shared into your account, so it will never show up by browsing your own account's ECR console. Lambda pulls it directly from AWS's registry, cross-account, at deploy time (the same mechanism SAR itself relies on). You can still inspect it from your account by telling the CLI explicitly which registry to look in — without `--registry-id`, `aws ecr` always assumes *your own* account's registry and 404s:
+
+```bash
+# Confirm the exact tag you're about to reference actually exists in that repo —
+# if AWS ever ages out an old connector version, this is the failure mode you'd hit.
+aws ecr describe-images \
+  --registry-id $CONNECTOR_ECR_ACCOUNT \
+  --repository-name athena-federation-repository-redshift \
+  --region $AWS_REGION \
+  --image-ids imageTag=2026.24.1
+
+# See every tag published for this connector, if you want to check what's available
+aws ecr describe-images \
+  --registry-id $CONNECTOR_ECR_ACCOUNT \
+  --repository-name athena-federation-repository-redshift \
+  --region $AWS_REGION \
+  --query 'imageDetails[].imageTags' --output text
+
+# Confirm the resource policy that's actually granting your account pull access
+aws ecr get-repository-policy \
+  --registry-id $CONNECTOR_ECR_ACCOUNT \
+  --repository-name athena-federation-repository-redshift \
+  --region $AWS_REGION
+```
+
+```bash
 cat > redshift-env.json <<EOF
 {
   "Variables": {
