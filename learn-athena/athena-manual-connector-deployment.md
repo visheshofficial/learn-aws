@@ -1,6 +1,6 @@
-# Athena Federated Queries: DynamoDB + MySQL (Manual Deployment, No SAR)
+# Athena Federated Queries: DynamoDB + MySQL + Redshift (Manual Deployment, No SAR)
 
-This guide deploys two Athena Query Federation connectors **manually** (uploading the pre-built connector `.jar` straight to Lambda — no SAR, no CloudFormation), seeds each data source with synthetic data, and runs federated queries that join across both. Every command is exact and runnable in order. The final section tears down every resource created.
+This guide deploys three Athena Query Federation connectors **manually** (uploading the pre-built connector `.jar` straight to Lambda — no SAR, no CloudFormation), seeds each data source with synthetic data, and runs federated queries that join across them. Every command is exact and runnable in order. The final section tears down every resource created.
 
 Connector version used throughout: **v2026.24.1** — asset filenames and required handler classes/env vars below were verified directly against the [aws-athena-query-federation](https://github.com/awslabs/aws-athena-query-federation) source at that tag (not assumed from older docs).
 
@@ -12,11 +12,12 @@ These were confirmed with you before writing any commands — change them if you
 |---|---|
 | Region | `us-east-1` |
 | MySQL hosting | New RDS MySQL instance, **VPC-private** (no public access in steady state) |
-| VPC | Your account's existing **default VPC** |
-| Seed-data access to private RDS | Temporarily open RDS to your own IP + flip `publicly-accessible` on, load data, then revert both |
-| Data model | DynamoDB table `customers` (PK `customer_id`) ⋈ MySQL table `orders` (`customer_id` FK), joined on `customer_id` |
+| Redshift hosting | New **single-node `dc2.large`** provisioned cluster, **VPC-private**. Not Redshift Serverless — in `us-east-1` Serverless has an 8-RPU minimum (~$3/hour active), while a single-node `dc2.large` is $0.25/hour flat with storage included, and may be free under AWS's 2-month Redshift free trial (750 `dc2.large` hours/month) if this account hasn't used one before |
+| VPC | Your account's existing **default VPC** — Redshift reuses the same VPC, subnets, and Secrets Manager/S3 endpoints the MySQL connector already needed, rather than standing up its own |
+| Seed-data access to private RDS/Redshift | Temporarily open to your own IP + flip `publicly-accessible` on, load data, then revert both |
+| Data model | DynamoDB table `customers` (PK `customer_id`) ⋈ MySQL table `orders` (`customer_id` FK) ⋈ Redshift table `payments` (`order_id` FK) — a three-source chain joined on `customer_id` then `order_id` |
 
-Key architectural fact this doc relies on (verified in source, not assumed): the DynamoDB connector needs **no VPC** at all. The MySQL connector's Lambda **must** be VPC-attached to reach RDS, which means it loses default internet access — so it also needs an **S3 Gateway endpoint** (for spilling) and a **Secrets Manager Interface endpoint** (for fetching DB credentials), both created below. Without those two endpoints the MySQL connector will fail at runtime even though it deploys successfully. (CloudWatch Logs works fine with no endpoint — Lambda ships logs via its control plane, not through your VPC ENI. The connector's own `athena:GetQueryExecution` call is best-effort/non-fatal if unreachable, confirmed in `QueryStatusChecker.java`, so no Athena VPC endpoint is needed.)
+Key architectural facts this doc relies on (verified in source, not assumed): the DynamoDB connector needs **no VPC** at all. The MySQL and Redshift connectors are both built on the same `athena-jdbc` codebase and **must** be VPC-attached to reach their respective databases, which means they lose default internet access — so each also needs the **S3 Gateway endpoint** (for spilling) and **Secrets Manager Interface endpoint** (for fetching DB credentials) created in Phase 4. Without those two endpoints, a VPC-attached connector will fail at runtime even though it deploys successfully. (CloudWatch Logs works fine with no endpoint — Lambda ships logs via its control plane, not through your VPC ENI. The connector's own `athena:GetQueryExecution` call is best-effort/non-fatal if unreachable, confirmed in `QueryStatusChecker.java`, so no Athena VPC endpoint is needed.) Redshift's connector handler (`RedshiftMuxCompositeHandler`), environment variable shape, and IAM permission set are all structurally identical to MySQL's — confirmed against `athena-redshift/athena-redshift.yaml` and `RedshiftConstants.java` at the same release tag — the only real differences are the port (5439), JDBC scheme (`redshift://jdbc:redshift://`), and driver class.
 
 ---
 
@@ -24,6 +25,7 @@ Key architectural fact this doc relies on (verified in source, not assumed): the
 
 - AWS CLI v2, configured (`aws configure`) with permissions to create IAM roles/policies, Lambda functions, S3 buckets, DynamoDB tables, RDS instances, EC2 security groups/VPC endpoints, Secrets Manager secrets, and Athena data catalogs.
 - A local `mysql` client (`mysql --version`) — used once, briefly, to seed RDS. On macOS, `brew install mysql-client` (**not** `mysql-shell`/`mysqlsh` — that's a different tool with different CLI syntax). It's keg-only, so add it to your PATH: `echo 'export PATH="/opt/homebrew/opt/mysql-client/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc`.
+- A local `psql` client, to seed Redshift (Redshift speaks the Postgres wire protocol). On macOS: `brew install libpq` — also keg-only: `echo 'export PATH="/opt/homebrew/opt/libpq/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc`.
 - `curl`, `openssl`, `jq` available locally.
 
 ---
@@ -66,6 +68,19 @@ export DB_SUBNET_GROUP="athena-mysql-subnet-group"
 export LAMBDA_SG_NAME="athena-mysql-lambda-sg"
 export RDS_SG_NAME="athena-mysql-rds-sg"
 export ENDPOINT_SG_NAME="athena-secretsmanager-endpoint-sg"
+
+# Redshift connector
+export REDSHIFT_LAMBDA="athena_redshift_connector"
+export REDSHIFT_CATALOG="redshift_catalog"
+export REDSHIFT_ROLE="AthenaRedshiftConnectorRole"
+export REDSHIFT_JAR="athena-redshift-2026.24.1.jar"
+export REDSHIFT_CLUSTER_ID="athena-federation-redshift"
+export REDSHIFT_DB_NAME="federation_demo"
+export REDSHIFT_MASTER_USERNAME="admin"
+export REDSHIFT_SECRET_NAME="AthenaRedshiftFederationSecret"
+export REDSHIFT_SUBNET_GROUP="athena-redshift-subnet-group"
+export REDSHIFT_LAMBDA_SG_NAME="athena-redshift-lambda-sg"
+export REDSHIFT_SG_NAME="athena-redshift-sg"
 
 mkdir -p ~/athena-federation-demo && cd ~/athena-federation-demo
 ```
@@ -116,7 +131,7 @@ aws s3api put-bucket-lifecycle-configuration \
 
 ### Set the Athena console's query result location
 
-The `run_query` helper in Phase 5 passes `--result-configuration` on every CLI call, so it doesn't need this. But if you run any query from the **Athena console** instead, it uses the `primary` workgroup's own result-location setting — which is unset by default and throws "Before you run your first query, you need to set up a query result location in Amazon S3." Set it once, now:
+The `run_query` helper in Phase 6 passes `--result-configuration` on every CLI call, so it doesn't need this. But if you run any query from the **Athena console** instead, it uses the `primary` workgroup's own result-location setting — which is unset by default and throws "Before you run your first query, you need to set up a query result location in Amazon S3." Set it once, now:
 
 ```bash
 aws athena update-work-group \
@@ -133,11 +148,15 @@ curl -L -o $DYNAMODB_JAR \
 curl -L -o $MYSQL_JAR \
   https://github.com/awslabs/aws-athena-query-federation/releases/download/v2026.24.1/$MYSQL_JAR
 
+curl -L -o $REDSHIFT_JAR \
+  https://github.com/awslabs/aws-athena-query-federation/releases/download/v2026.24.1/$REDSHIFT_JAR
+
 aws s3 cp $DYNAMODB_JAR s3://$CODE_BUCKET/connectors/$DYNAMODB_JAR
 aws s3 cp $MYSQL_JAR s3://$CODE_BUCKET/connectors/$MYSQL_JAR
+aws s3 cp $REDSHIFT_JAR s3://$CODE_BUCKET/connectors/$REDSHIFT_JAR
 ```
 
-> Both jars are self-contained (Maven shade plugin bundles the JDBC driver / AWS SDK / federation SDK), so no separate dependency jar is needed — confirmed from `athena-mysql/pom.xml`'s `maven-shade-plugin` config.
+> All three jars are self-contained (Maven shade plugin bundles the JDBC driver / AWS SDK / federation SDK), so no separate dependency jar is needed — confirmed from `athena-mysql/pom.xml`'s and `athena-redshift/pom.xml`'s `maven-shade-plugin` config.
 
 ---
 
@@ -687,7 +706,276 @@ aws athena create-data-catalog \
 
 ---
 
-## Phase 5: Query each source through Athena
+## Phase 5: Redshift source — cluster, data, connector, catalog
+
+Redshift's connector is built on the same `athena-jdbc` codebase as MySQL's — same handler shape (`RedshiftMuxCompositeHandler`, the Redshift analogue of `MySqlMuxCompositeHandler`), same `default` connection-string env var format, same Secrets Manager credential mechanism, same required `JAVA_TOOL_OPTIONS` fix. This phase reuses the VPC, subnets, S3 Gateway endpoint, and Secrets Manager Interface endpoint already created in Phase 4 — only new security groups are created.
+
+### 5.1 Create the Redshift cluster subnet group
+
+```bash
+check_vars SUBNET_IDS || return 1
+
+aws redshift create-cluster-subnet-group \
+  --cluster-subnet-group-name $REDSHIFT_SUBNET_GROUP \
+  --description "Subnets for Athena Redshift federation demo" \
+  --subnet-ids $SUBNET_IDS
+```
+
+### 5.2 Security groups
+
+```bash
+check_vars VPC_ID || return 1
+
+export REDSHIFT_LAMBDA_SG_ID=$(aws ec2 create-security-group \
+  --group-name $REDSHIFT_LAMBDA_SG_NAME \
+  --description "Athena Redshift connector Lambda" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+export REDSHIFT_SG_ID=$(aws ec2 create-security-group \
+  --group-name $REDSHIFT_SG_NAME \
+  --description "Redshift cluster for Athena federation demo" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $REDSHIFT_SG_ID \
+  --protocol tcp --port 5439 \
+  --source-group $REDSHIFT_LAMBDA_SG_ID
+```
+
+The existing Secrets Manager VPC endpoint (from Phase 4.3) only allows inbound 443 from the MySQL Lambda's security group — this new Redshift Lambda has its own, different security group, so it needs its own explicit rule added to that same endpoint:
+
+```bash
+check_vars ENDPOINT_SG_ID || return 1
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $ENDPOINT_SG_ID \
+  --protocol tcp --port 443 \
+  --source-group $REDSHIFT_LAMBDA_SG_ID
+```
+
+### 5.3 Create the Redshift cluster (private, single-node)
+
+A single-node `dc2.large` is the cheapest predictable option for a short-lived POC — $0.25/hour flat, storage included, no separate RPU-style minimum the way Redshift Serverless has (8 RPU minimum in `us-east-1`, ~$3/hour active). Check your account for Redshift's 2-month free-trial banner before creating this — if eligible, this costs nothing.
+
+```bash
+export REDSHIFT_MASTER_PASSWORD="Aa1$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)"
+echo "Redshift master password (save this — you'll need it to seed data): $REDSHIFT_MASTER_PASSWORD"
+```
+
+(Prefixing with `Aa1` guarantees Redshift's password policy — at least one uppercase, one lowercase, one digit — regardless of what the random draw produced, without needing to inspect and retry.)
+
+```bash
+aws redshift create-cluster \
+  --cluster-identifier $REDSHIFT_CLUSTER_ID \
+  --node-type dc2.large \
+  --cluster-type single-node \
+  --master-username $REDSHIFT_MASTER_USERNAME \
+  --master-user-password "$REDSHIFT_MASTER_PASSWORD" \
+  --db-name $REDSHIFT_DB_NAME \
+  --cluster-subnet-group-name $REDSHIFT_SUBNET_GROUP \
+  --vpc-security-group-ids $REDSHIFT_SG_ID \
+  --no-publicly-accessible \
+  --encrypted
+
+aws redshift wait cluster-available --cluster-identifier $REDSHIFT_CLUSTER_ID
+
+export REDSHIFT_ENDPOINT=$(aws redshift describe-clusters \
+  --cluster-identifier $REDSHIFT_CLUSTER_ID \
+  --query 'Clusters[0].Endpoint.Address' --output text)
+echo "Redshift endpoint: $REDSHIFT_ENDPOINT"
+```
+
+### 5.4 Store master credentials in Secrets Manager
+
+Same JSON shape as MySQL's — the credential-fetching code (`DefaultCredentialsProvider`) is shared across all JDBC connectors, not MySQL-specific.
+
+```bash
+aws secretsmanager create-secret \
+  --name $REDSHIFT_SECRET_NAME \
+  --description "Master credentials for Athena Redshift federation demo" \
+  --secret-string "{\"username\":\"${REDSHIFT_MASTER_USERNAME}\",\"password\":\"${REDSHIFT_MASTER_PASSWORD}\"}"
+
+export REDSHIFT_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id $REDSHIFT_SECRET_NAME --query 'ARN' --output text)
+```
+
+### 5.5 Temporarily open Redshift to your IP and seed synthetic data
+
+Same temporary-access pattern as MySQL: private by default, briefly opened, then reverted.
+
+```bash
+export MY_IP=$(curl -s https://checkip.amazonaws.com)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $REDSHIFT_SG_ID \
+  --protocol tcp --port 5439 \
+  --cidr "${MY_IP}/32"
+
+aws redshift modify-cluster \
+  --cluster-identifier $REDSHIFT_CLUSTER_ID \
+  --publicly-accessible
+
+aws redshift wait cluster-available --cluster-identifier $REDSHIFT_CLUSTER_ID
+```
+
+Create the `payments` table and insert rows referencing the MySQL `orders.order_id` values from Phase 4 (order_id 1–18 get a payment; 19 and 20 are deliberately left unpaid, to show a `LEFT JOIN` producing `NULL`s later):
+
+```bash
+PGPASSWORD="$REDSHIFT_MASTER_PASSWORD" psql -h "$REDSHIFT_ENDPOINT" -p 5439 -U "$REDSHIFT_MASTER_USERNAME" -d "$REDSHIFT_DB_NAME" <<'SQL'
+CREATE TABLE payments (
+  payment_id INT IDENTITY(1,1) PRIMARY KEY,
+  order_id INT NOT NULL,
+  payment_method VARCHAR(20) NOT NULL,
+  paid_amount DECIMAL(10,2) NOT NULL,
+  paid_at DATE NOT NULL
+);
+
+INSERT INTO payments (order_id, payment_method, paid_amount, paid_at) VALUES
+(1,  'credit_card', 24.99,  '2026-01-06'),
+(2,  'credit_card', 89.50,  '2026-02-15'),
+(3,  'paypal',      34.00,  '2026-01-21'),
+(4,  'credit_card', 45.75,  '2026-03-03'),
+(5,  'debit_card',  59.99,  '2026-04-12'),
+(6,  'credit_card', 199.99, '2026-01-31'),
+(7,  'paypal',      69.25,  '2026-05-07'),
+(8,  'credit_card', 109.00, '2026-02-09'),
+(9,  'debit_card',  9.99,   '2026-02-10'),
+(10, 'credit_card', 79.99,  '2026-06-02'),
+(11, 'paypal',      29.99,  '2026-01-16'),
+(12, 'credit_card', 64.50,  '2026-03-23'),
+(13, 'debit_card',  19.99,  '2026-04-03'),
+(14, 'credit_card', 74.00,  '2026-05-01'),
+(15, 'paypal',      149.99, '2026-06-19'),
+(16, 'credit_card', 39.99,  '2026-02-26'),
+(17, 'credit_card', 89.99,  '2026-05-15'),
+(18, 'debit_card',  22.50,  '2026-01-11');
+SQL
+```
+
+Verify:
+
+```bash
+PGPASSWORD="$REDSHIFT_MASTER_PASSWORD" psql -h "$REDSHIFT_ENDPOINT" -p 5439 -U "$REDSHIFT_MASTER_USERNAME" -d "$REDSHIFT_DB_NAME" \
+  -c "SELECT COUNT(*) FROM payments;"
+```
+
+Revert access:
+
+```bash
+aws redshift modify-cluster --cluster-identifier $REDSHIFT_CLUSTER_ID --no-publicly-accessible
+aws redshift wait cluster-available --cluster-identifier $REDSHIFT_CLUSTER_ID
+aws ec2 revoke-security-group-ingress --group-id $REDSHIFT_SG_ID --protocol tcp --port 5439 --cidr "${MY_IP}/32"
+```
+
+### 5.6 IAM role for the Redshift connector Lambda
+
+Structurally identical to the MySQL role — `AWSLambdaVPCAccessExecutionRole` (VPC-attached, needs ENI permissions) plus an inline policy scoped to this connector's own secret.
+
+```bash
+aws iam create-role \
+  --role-name $REDSHIFT_ROLE \
+  --assume-role-policy-document file://trust-policy.json
+
+aws iam attach-role-policy \
+  --role-name $REDSHIFT_ROLE \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+cat > redshift-connector-permissions.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SecretAccess",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "${REDSHIFT_SECRET_ARN}"
+    },
+    {
+      "Sid": "AthenaInvoke",
+      "Effect": "Allow",
+      "Action": "athena:GetQueryExecution",
+      "Resource": "*"
+    },
+    {
+      "Sid": "SpillBucketAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation", "s3:GetObjectVersion",
+        "s3:PutObject", "s3:PutObjectAcl", "s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration", "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${SPILL_BUCKET}",
+        "arn:aws:s3:::${SPILL_BUCKET}/*"
+      ]
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name $REDSHIFT_ROLE \
+  --policy-name AthenaRedshiftConnectorPermissions \
+  --policy-document file://redshift-connector-permissions.json
+
+export REDSHIFT_ROLE_ARN=$(aws iam get-role --role-name $REDSHIFT_ROLE --query 'Role.Arn' --output text)
+```
+
+### 5.7 Create the Redshift connector Lambda function
+
+```bash
+check_vars SUBNET_IDS REDSHIFT_LAMBDA_SG_ID REDSHIFT_ROLE_ARN CODE_BUCKET REDSHIFT_JAR REDSHIFT_ENDPOINT REDSHIFT_SECRET_NAME || return 1
+
+export SUBNET_IDS_CSV=$(echo $SUBNET_IDS | tr ' ' ',')
+
+cat > redshift-env.json <<EOF
+{
+  "Variables": {
+    "spill_bucket": "${SPILL_BUCKET}",
+    "spill_prefix": "athena-spill",
+    "disable_spill_encryption": "false",
+    "default": "redshift://jdbc:redshift://${REDSHIFT_ENDPOINT}:5439/${REDSHIFT_DB_NAME}?\${${REDSHIFT_SECRET_NAME}}",
+    "JAVA_TOOL_OPTIONS": "--add-opens=java.base/java.nio=ALL-UNNAMED"
+  }
+}
+EOF
+cat redshift-env.json   # sanity check: "default" should literally contain ${AthenaRedshiftFederationSecret}
+
+aws lambda create-function \
+  --function-name $REDSHIFT_LAMBDA \
+  --runtime java21 \
+  --role $REDSHIFT_ROLE_ARN \
+  --handler com.amazonaws.athena.connectors.redshift.RedshiftMuxCompositeHandler \
+  --code S3Bucket=$CODE_BUCKET,S3Key=connectors/$REDSHIFT_JAR \
+  --memory-size 3008 \
+  --timeout 900 \
+  --vpc-config SubnetIds=$SUBNET_IDS_CSV,SecurityGroupIds=$REDSHIFT_LAMBDA_SG_ID \
+  --environment file://redshift-env.json
+
+aws lambda wait function-active --function-name $REDSHIFT_LAMBDA
+```
+
+### 5.8 Register the Redshift Athena Data Catalog
+
+```bash
+export REDSHIFT_LAMBDA_ARN=$(aws lambda get-function --function-name $REDSHIFT_LAMBDA --query 'Configuration.FunctionArn' --output text)
+
+aws lambda add-permission \
+  --function-name $REDSHIFT_LAMBDA \
+  --statement-id AllowAthenaInvoke \
+  --action lambda:InvokeFunction \
+  --principal athena.amazonaws.com
+
+aws athena create-data-catalog \
+  --name $REDSHIFT_CATALOG \
+  --type LAMBDA \
+  --description "Redshift connector for federation demo" \
+  --parameters "function=$REDSHIFT_LAMBDA_ARN"
+```
+
+---
+
+## Phase 6: Query each source through Athena
 
 A small helper to run a query and print results (used for every query below):
 
@@ -723,7 +1011,7 @@ run_query () {
 }
 ```
 
-### 5.1 DynamoDB source alone
+### 6.1 DynamoDB source alone
 
 ```bash
 run_query "SHOW TABLES IN ${DYNAMODB_CATALOG}.default" "Catalog=${DYNAMODB_CATALOG}"
@@ -731,7 +1019,7 @@ run_query "SHOW TABLES IN ${DYNAMODB_CATALOG}.default" "Catalog=${DYNAMODB_CATAL
 run_query "SELECT * FROM ${DYNAMODB_CATALOG}.default.customers ORDER BY customer_id" "Catalog=${DYNAMODB_CATALOG}"
 ```
 
-### 5.2 MySQL source alone
+### 6.2 MySQL source alone
 
 ```bash
 run_query "SHOW TABLES IN ${MYSQL_CATALOG}.${MYSQL_DB_NAME}" "Catalog=${MYSQL_CATALOG}"
@@ -739,9 +1027,19 @@ run_query "SHOW TABLES IN ${MYSQL_CATALOG}.${MYSQL_DB_NAME}" "Catalog=${MYSQL_CA
 run_query "SELECT * FROM ${MYSQL_CATALOG}.${MYSQL_DB_NAME}.orders ORDER BY order_id" "Catalog=${MYSQL_CATALOG}"
 ```
 
+### 6.3 Redshift source alone
+
+```bash
+run_query "SHOW TABLES IN ${REDSHIFT_CATALOG}.public" "Catalog=${REDSHIFT_CATALOG}"
+
+run_query "SELECT * FROM ${REDSHIFT_CATALOG}.public.payments ORDER BY payment_id" "Catalog=${REDSHIFT_CATALOG}"
+```
+
+(Redshift's default schema is `public`, not `default` — that's a Postgres/Redshift convention, unlike DynamoDB's connector which always uses `default`.)
+
 ---
 
-## Phase 6: Federated queries — how it works, and running one
+## Phase 7: Federated queries — how it works, and running one
 
 **How federated queries work:** when a query references a Lambda-backed catalog, Athena's query engine calls the connector Lambda twice per source, not once. First it invokes the connector's **metadata handler** to learn what tables/columns exist and how the data is split for parallel reads. Then, during execution, it invokes the connector's **record handler** (potentially many times in parallel) to actually fetch rows — each invocation returns an Arrow-encoded batch, spilling to the S3 spill bucket if a batch is too large for the Lambda's memory. Athena's engine collects the rows returned from **every** catalog referenced in the query and performs the actual `JOIN`/aggregation itself — the join logic never runs inside either connector Lambda; each Lambda only ever sees requests for its own source's rows.
 
@@ -780,11 +1078,35 @@ ORDER BY total_spent DESC
 "
 ```
 
-If either query is slow the first time, that's expected — it's a cold-start Lambda invocation for both connectors plus VPC ENI attachment latency for the MySQL one; subsequent queries are faster.
+### Three-way federated join
+
+The same mechanism scales to a third catalog with no special syntax — Athena invokes a third connector Lambda for the third source and folds its rows into the same join. This chains all three sources: DynamoDB `customers` → MySQL `orders` → Redshift `payments`, using a `LEFT JOIN` on the last hop so orders 19 and 20 (deliberately left unpaid in Phase 5.5) show up with `NULL` payment columns instead of being dropped:
+
+```bash
+run_query "
+SELECT
+  c.name,
+  c.email,
+  o.order_id,
+  o.product,
+  o.amount        AS order_amount,
+  p.payment_method,
+  p.paid_amount,
+  p.paid_at
+FROM ${DYNAMODB_CATALOG}.default.customers c
+JOIN ${MYSQL_CATALOG}.${MYSQL_DB_NAME}.orders o
+  ON c.customer_id = o.customer_id
+LEFT JOIN ${REDSHIFT_CATALOG}.public.payments p
+  ON o.order_id = p.order_id
+ORDER BY o.order_id
+"
+```
+
+If any query is slow the first time, that's expected — it's a cold-start Lambda invocation for every connector involved, plus VPC ENI attachment latency for the MySQL and Redshift ones; subsequent queries are faster.
 
 ---
 
-## Phase 7: dbt as a data quality framework on top of the federated sources
+## Phase 8: dbt as a data quality framework on top of the federated sources
 
 Project files already created at `dbt/athena_federation/` in this repo:
 
@@ -807,7 +1129,7 @@ dbt/athena_federation/
 
 Verified against the actual package (not assumed): `dbt-athena-community` is now just a thin shim that depends on the real package, `dbt-athena` — install `dbt-athena` directly. Current version is `1.10.2`, requires Python ≥3.10.
 
-### 7.1 Install dependencies
+### 8.1 Install dependencies
 
 ```bash
 python3 --version   # must be 3.10+; if not: brew install python@3.12
@@ -826,7 +1148,7 @@ dbt --version
 
 `source .venv/bin/activate` is identical in bash and zsh — no shell-specific behavior here.
 
-### 7.2 Create the Athena database dbt will materialize models into
+### 8.2 Create the Athena database dbt will materialize models into
 
 dbt needs a Glue-backed Athena database to write its own tables into (separate from `dynamodb_catalog`/`mysql_catalog`, which are federated and read-only). Reusing `$RESULTS_BUCKET` with a distinct prefix avoids standing up another bucket to tear down later.
 
@@ -836,9 +1158,9 @@ check_vars RESULTS_BUCKET AWS_REGION || return 1
 run_query "CREATE DATABASE IF NOT EXISTS dbt_athena_federation LOCATION 's3://${RESULTS_BUCKET}/dbt-models/'"
 ```
 
-(`run_query` is the helper function defined in Phase 5 — re-paste it into this shell if it's not already defined here.)
+(`run_query` is the helper function defined in Phase 6 — re-paste it into this shell if it's not already defined here.)
 
-### 7.3 Write your dbt profile
+### 8.3 Write your dbt profile
 
 `profiles.yml` holds environment-specific config (bucket paths, AWS profile) and conventionally lives outside the project directory, at `~/.dbt/profiles.yml` — not committed to the repo. Generated from your already-exported variables, so nothing is hardcoded:
 
@@ -866,7 +1188,7 @@ EOF
 
 If you're not using a named AWS CLI profile (e.g. you're using env-var credentials instead), drop the `aws_profile_name` line — the adapter falls back to standard boto3 credential resolution.
 
-### 7.4 Run it
+### 8.4 Run it
 
 ```bash
 cd /path/to/learn-athena/dbt/athena_federation
@@ -879,7 +1201,7 @@ dbt test      # runs schema tests (not_null/unique/relationships) + the singular
 
 `dbt test` is the actual data-quality framework moment here: the `relationships` test in `_staging.yml` verifies every `customer_id` in the **MySQL** `orders` table actually exists in the **DynamoDB** `customers` table — a referential-integrity check spanning two physically different databases, computed by a single federated Athena query dbt generates and runs for you.
 
-### 7.5 Tear down the dbt-created resources
+### 8.5 Tear down the dbt-created resources
 
 These aren't covered by the main teardown below since they weren't created by it — do this alongside step 9/10 of the main teardown:
 
@@ -905,10 +1227,12 @@ Run top to bottom. Each step assumes the variables from Phase 0 are still export
 # 1. Athena data catalogs
 aws athena delete-data-catalog --name $DYNAMODB_CATALOG
 aws athena delete-data-catalog --name $MYSQL_CATALOG
+aws athena delete-data-catalog --name $REDSHIFT_CATALOG
 
 # 2. Lambda functions (this also removes the athena.amazonaws.com invoke permission)
 aws lambda delete-function --function-name $DYNAMODB_LAMBDA
 aws lambda delete-function --function-name $MYSQL_LAMBDA
+aws lambda delete-function --function-name $REDSHIFT_LAMBDA
 
 # 3. IAM roles
 aws iam delete-role-policy --role-name $DYNAMODB_ROLE --policy-name AthenaDynamoDBConnectorPermissions
@@ -919,6 +1243,10 @@ aws iam delete-role-policy --role-name $MYSQL_ROLE --policy-name AthenaMySQLConn
 aws iam detach-role-policy --role-name $MYSQL_ROLE --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
 aws iam delete-role --role-name $MYSQL_ROLE
 
+aws iam delete-role-policy --role-name $REDSHIFT_ROLE --policy-name AthenaRedshiftConnectorPermissions
+aws iam detach-role-policy --role-name $REDSHIFT_ROLE --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+aws iam delete-role --role-name $REDSHIFT_ROLE
+
 # 4. RDS instance (backup-retention was 0, so no final snapshot exists to manage)
 aws rds delete-db-instance \
   --db-instance-identifier $MYSQL_DB_INSTANCE_ID \
@@ -927,10 +1255,18 @@ aws rds delete-db-instance \
 
 aws rds wait db-instance-deleted --db-instance-identifier $MYSQL_DB_INSTANCE_ID
 
-# 5. DB subnet group
-aws rds delete-db-subnet-group --db-subnet-group-name $DB_SUBNET_GROUP
+# 5. Redshift cluster (no final snapshot, same reasoning as the RDS instance)
+aws redshift delete-cluster \
+  --cluster-identifier $REDSHIFT_CLUSTER_ID \
+  --skip-final-cluster-snapshot
 
-# 6. VPC endpoints
+aws redshift wait cluster-deleted --cluster-identifier $REDSHIFT_CLUSTER_ID
+
+# 6. Subnet groups
+aws rds delete-db-subnet-group --db-subnet-group-name $DB_SUBNET_GROUP
+aws redshift delete-cluster-subnet-group --cluster-subnet-group-name $REDSHIFT_SUBNET_GROUP
+
+# 7. VPC endpoints
 export S3_ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
   --filters Name=vpc-id,Values=$VPC_ID Name=service-name,Values=com.amazonaws.$AWS_REGION.s3 \
   --query 'VpcEndpoints[0].VpcEndpointId' --output text)
@@ -940,20 +1276,26 @@ export SECRETSMANAGER_ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
 
 aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $S3_ENDPOINT_ID $SECRETSMANAGER_ENDPOINT_ID
 
-# 7. Security groups (wait a few seconds after step 6 for ENIs to detach before deleting)
+# 8. Security groups (wait a few seconds after step 7 for ENIs to detach before deleting)
 aws ec2 delete-security-group --group-id $RDS_SG_ID
+aws ec2 delete-security-group --group-id $REDSHIFT_SG_ID
 aws ec2 delete-security-group --group-id $ENDPOINT_SG_ID
 aws ec2 delete-security-group --group-id $LAMBDA_SG_ID
+aws ec2 delete-security-group --group-id $REDSHIFT_LAMBDA_SG_ID
 
-# 8. DynamoDB table
+# 9. DynamoDB table
 aws dynamodb delete-table --table-name $DYNAMODB_TABLE
 
-# 9. Secrets Manager secret (force-delete, no 7-30 day recovery window, since this is a demo)
+# 10. Secrets Manager secrets (force-delete, no 7-30 day recovery window, since this is a demo)
 aws secretsmanager delete-secret \
   --secret-id $MYSQL_SECRET_NAME \
   --force-delete-without-recovery
 
-# 10. S3 buckets (empty, then delete)
+aws secretsmanager delete-secret \
+  --secret-id $REDSHIFT_SECRET_NAME \
+  --force-delete-without-recovery
+
+# 11. S3 buckets (empty, then delete)
 aws s3 rm s3://$CODE_BUCKET --recursive
 aws s3 rb s3://$CODE_BUCKET
 
@@ -967,12 +1309,13 @@ aws s3 rb s3://$RESULTS_BUCKET
 ### Verify nothing is left
 
 ```bash
-aws athena list-data-catalogs --query "DataCatalogsSummary[?CatalogName=='${DYNAMODB_CATALOG}' || CatalogName=='${MYSQL_CATALOG}']"
-aws lambda list-functions --query "Functions[?FunctionName=='${DYNAMODB_LAMBDA}' || FunctionName=='${MYSQL_LAMBDA}']"
+aws athena list-data-catalogs --query "DataCatalogsSummary[?CatalogName=='${DYNAMODB_CATALOG}' || CatalogName=='${MYSQL_CATALOG}' || CatalogName=='${REDSHIFT_CATALOG}']"
+aws lambda list-functions --query "Functions[?FunctionName=='${DYNAMODB_LAMBDA}' || FunctionName=='${MYSQL_LAMBDA}' || FunctionName=='${REDSHIFT_LAMBDA}']"
 aws rds describe-db-instances --query "DBInstances[?DBInstanceIdentifier=='${MYSQL_DB_INSTANCE_ID}']"
+aws redshift describe-clusters --query "Clusters[?ClusterIdentifier=='${REDSHIFT_CLUSTER_ID}']"
 aws dynamodb list-tables --query "TableNames[?@=='${DYNAMODB_TABLE}']"
 aws s3 ls | grep athena-federation
-aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=$LAMBDA_SG_NAME,$RDS_SG_NAME,$ENDPOINT_SG_NAME
+aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=$LAMBDA_SG_NAME,$RDS_SG_NAME,$ENDPOINT_SG_NAME,$REDSHIFT_LAMBDA_SG_NAME,$REDSHIFT_SG_NAME
 ```
 
-Every query above should return empty. If the security group deletions in step 7 failed with a dependency error, wait ~30 seconds (ENI detachment from the VPC endpoints/Lambda lags slightly) and re-run just that step.
+Every query above should return empty. If any security group deletion in step 8 fails with a dependency error, wait ~30 seconds (ENI detachment from the VPC endpoints/Lambdas lags slightly) and re-run just that step.
