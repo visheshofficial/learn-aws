@@ -943,30 +943,22 @@ export REDSHIFT_IMAGE_URI="${CONNECTOR_ECR_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazon
 echo "Image: $REDSHIFT_IMAGE_URI"
 ```
 
-`292517598671` is an **AWS-owned account, not yours** — this image is never copied or shared into your account, so it will never show up by browsing your own account's ECR console. Lambda pulls it directly from AWS's registry, cross-account, at deploy time (the same mechanism SAR itself relies on). You can still inspect it from your account by telling the CLI explicitly which registry to look in — without `--registry-id`, `aws ecr` always assumes *your own* account's registry and 404s:
+`292517598671` is an **AWS-owned account, not yours** — this image is never copied or shared into your account, so it will never show up by browsing your own account's ECR console, and there's no CLI equivalent that lists its contents from the outside either. Its resource policy grants only the specific pull actions Lambda's image-fetch mechanism uses (`BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability`) — not introspection actions like `ecr:DescribeImages` or `ecr:GetRepositoryPolicy`. Trying either of those (even with `--registry-id` set correctly) gets `AccessDeniedException: ... because no resource-based policy allows the ecr:DescribeImages action` — that's expected, not a sign anything is misconfigured on your end, and it tells you nothing about whether the actual image pull will succeed; they're different IAM actions entirely.
+
+The only real test is `create-function` itself:
 
 ```bash
-# Confirm the exact tag you're about to reference actually exists in that repo —
-# if AWS ever ages out an old connector version, this is the failure mode you'd hit.
-aws ecr describe-images \
-  --registry-id $CONNECTOR_ECR_ACCOUNT \
-  --repository-name athena-federation-repository-redshift \
-  --region $AWS_REGION \
-  --image-ids imageTag=2026.24.1
+aws lambda create-function \
+  --function-name redshift-image-check \
+  --package-type Image \
+  --role $REDSHIFT_ROLE_ARN \
+  --code ImageUri=$REDSHIFT_IMAGE_URI \
+  --image-config file://redshift-image-config.json
 
-# See every tag published for this connector, if you want to check what's available
-aws ecr describe-images \
-  --registry-id $CONNECTOR_ECR_ACCOUNT \
-  --repository-name athena-federation-repository-redshift \
-  --region $AWS_REGION \
-  --query 'imageDetails[].imageTags' --output text
-
-# Confirm the resource policy that's actually granting your account pull access
-aws ecr get-repository-policy \
-  --registry-id $CONNECTOR_ECR_ACCOUNT \
-  --repository-name athena-federation-repository-redshift \
-  --region $AWS_REGION
+aws lambda delete-function --function-name redshift-image-check
 ```
+
+If the tag genuinely doesn't exist, this fails immediately with something like `ImageNotFoundException` rather than a permissions error — a clearly different failure mode you'd recognize. Since the real `create-function` call below does the identical check as a side effect, this is only worth running standalone if you want to confirm the image before wiring up the rest of the environment/VPC config.
 
 ```bash
 cat > redshift-env.json <<EOF
