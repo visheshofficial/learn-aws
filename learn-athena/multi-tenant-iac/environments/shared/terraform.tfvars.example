@@ -1,0 +1,6 @@
+# Every value here has a default — copy to terraform.tfvars only if you need to
+# override something.
+aws_region            = "us-east-1"
+name_prefix           = "athena-fed"
+connector_version     = "2026.24.1"
+dynamodb_table_prefix = "tenant_"

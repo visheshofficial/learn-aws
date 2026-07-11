@@ -1,7 +1,0 @@
-# Copy to terraform.tfvars (gitignored) if you want to override any default —
-# none of these are required, the defaults below are what's actually applied
-# if you skip this file entirely.
-aws_region             = "us-east-1"
-name_prefix            = "athena-fed"
-connector_version      = "2026.24.1"
-dynamodb_table_prefix  = "tenant_"

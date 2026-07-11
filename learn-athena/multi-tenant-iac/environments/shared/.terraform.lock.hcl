@@ -20,7 +20,8 @@ provider "registry.opentofu.org/hashicorp/aws" {
 }
 
 provider "registry.opentofu.org/hashicorp/null" {
-  version = "3.3.0"
+  version     = "3.3.0"
+  constraints = "~> 3.2"
   hashes = [
     "h1:mdu+qpyVmjDDLMrcL1JFy+cSyF58I3TFJwB5NssCZ58=",
     "zh:083dcc0bec53f8abfa3f2aa2ce9d732a9675338fd60ae7d61162e25db7cb08bf",

@@ -1,0 +1,2 @@
+# Copy to terraform.tfvars and set your tenant id.
+tenant_id = "acme"

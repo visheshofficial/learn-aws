@@ -21,7 +21,7 @@ That distinction, why DynamoDB has no multiplexing (and doesn't need it), and th
 | MySQL topology | **One Lambda per tenant** (Option A), each with a dedicated RDS instance, security groups, Athena Data Catalog and Workgroup | A shared mux'd Lambda is possible, but it would need IAM access to *every* tenant's secret and a network path to *every* tenant's RDS, and it would forfeit the independent-per-tenant-state structure. See the decision doc. |
 | DynamoDB topology | **One shared Lambda**, one table per tenant (`tenant_<id>_customers`), one shared Athena Data Catalog, IAM role scoped to the `tenant_*` table-name wildcard | DynamoDB has no per-tenant endpoint or credential to route between — a shared Lambda is the natural shape here, not a compromise |
 | Shared networking | One VPC (default VPC), one S3 Gateway endpoint, one Secrets Manager Interface endpoint, one RDS subnet group | Network plumbing, not data access — sharing it doesn't weaken isolation the way sharing compute/credentials would |
-| Terraform structure | A `modules/tenant` module, invoked from a **separate root config per tenant** (own state file), plus one `shared/` root config for one-time infrastructure | Tenants are fully independent to apply/destroy; onboarding never touches another tenant's state |
+| Terraform structure | Six focused modules under `modules/`, instantiated by thin environments under `environments/` — one `shared/` environment plus **one environment per tenant, each with its own state file** | Tenants are fully independent to apply/destroy; onboarding never touches another tenant's state. The `athena-connector` module is shared by the DynamoDB and MySQL connectors alike. |
 | Tenant input surface | Just `tenant_id` | Everything else — table names, secret names, catalog names, workgroup names, a generated password — is derived or generated inside the module |
 
 ### The second isolation layer: Athena's own IAM
@@ -31,7 +31,7 @@ Independent of Lambda topology, Athena's control plane can enforce tenant isolat
 - `athena:GetDataCatalog`, `GetDatabase`, `GetTableMetadata`, `ListDatabases`, `ListTableMetadata` support **resource-level IAM scoping to a single `datacatalog` ARN** (`arn:aws:athena:region:account:datacatalog/<name>`).
 - `athena:StartQueryExecution`, `GetQueryExecution`, `GetQueryResults` and friends support **resource-level IAM scoping to a single `workgroup` ARN**.
 
-So a tenant's query role can be restricted to "only resolve metadata for catalog X, only run queries in workgroup Y" with actual `Resource:`-scoped IAM — not security-through-obscurity. `modules/tenant` does exactly this (`aws_iam_role.query`), which is why a tenant cannot query another tenant's catalog **regardless of which Lambda topology you pick**. Per-tenant Lambdas (data-plane isolation) and catalog/workgroup-scoped IAM (control-plane isolation) are defense in depth, not alternatives.
+So a tenant's query role can be restricted to "only resolve metadata for catalog X, only run queries in workgroup Y" with actual `Resource:`-scoped IAM — not security-through-obscurity. `modules/tenant-access` does exactly this (`aws_iam_role.query`), which is why a tenant cannot query another tenant's catalog **regardless of which Lambda topology you pick**. Per-tenant Lambdas (data-plane isolation) and catalog/workgroup-scoped IAM (control-plane isolation) are defense in depth, not alternatives.
 
 ### "Use Athena/Trino"
 
@@ -41,28 +41,45 @@ Athena's query engine (v3) is Trino under the hood. Every tenant's `aws_athena_w
 
 ## Repo layout
 
+Every reusable piece is a module; environments are thin wiring that instantiates them and holds no raw resources of their own.
+
 ```
 multi-tenant-iac/
-├── shared/                        # applied once — the account-level shared infra
-│   ├── main.tf                    # VPC lookups, S3 buckets, VPC endpoints, DynamoDB connector Lambda + catalog
-│   ├── variables.tf                # aws_region, name_prefix, connector_version, dynamodb_table_prefix — all defaulted
-│   ├── outputs.tf                  # everything a tenant config needs to read via remote state
-│   ├── versions.tf                 # provider + local backend
-│   └── terraform.tfvars.example
-├── modules/tenant/                # reusable — one full tenant's worth of isolated MySQL infra + shared-DynamoDB wiring
-│   ├── main.tf
-│   ├── variables.tf                 # tenant_id is the only one without a default
-│   └── outputs.tf
+├── modules/
+│   ├── connector-artifacts/    S3 code/spill/results buckets + connector jar fetch & upload
+│   ├── federation-network/     VPC lookup, S3 gateway endpoint, Secrets Manager interface
+│   │                           endpoint + its SG, shared RDS subnet group
+│   ├── athena-connector/    ★  GENERIC connector: IAM role + policies, Lambda (VPC optional),
+│   │                           Athena invoke permission, Athena Data Catalog.
+│   │                           Instantiated TWICE — DynamoDB (shared) and MySQL (per tenant)
+│   ├── tenant-network/         This tenant's Lambda SG + RDS SG
+│   ├── tenant-datastores/      This tenant's DynamoDB table, RDS instance, generated password, secret
+│   └── tenant-access/          This tenant's Athena workgroup + scoped query IAM role
+│
 └── environments/
-    └── example-tenant/             # COPY this directory per tenant — this is the "separate root config" per your choice
-        ├── main.tf                  # reads shared/ state, calls modules/tenant
-        ├── variables.tf             # tenant_id (required), aws_region + shared_state_path (defaulted)
-        ├── outputs.tf
-        ├── versions.tf
-        └── terraform.tfvars.example
+    ├── shared/                 Applied ONCE. = connector-artifacts + federation-network
+    │                             + athena-connector (DynamoDB flavor)
+    └── tenant-1/               COPY THIS PER TENANT. = tenant-network + tenant-datastores
+                                  + athena-connector (MySQL flavor) + tenant-access
 ```
 
-All four `.tf` root/module trees were run through `tofu validate` (OpenTofu — Terraform's open-source fork, same HCL, same provider ecosystem) against the real `hashicorp/aws` v5 provider schema while building this, so the resource arguments below aren't guessed. Everywhere this doc says `terraform`, `tofu` works identically if that's what you have installed.
+**The `athena-connector` module is the point of the whole decomposition.** The DynamoDB connector and every tenant's MySQL connector are the same seven-resource pattern — IAM trust doc, role, execution-policy attachment, data-source policy, Lambda, Athena invoke permission, Data Catalog. They differ only in handler class, jar, environment variables, IAM statements, and whether a VPC is attached. All five are module inputs, so there is exactly one implementation of "an Athena federation connector" in this repo.
+
+### Why `tenant-network` is a separate module
+
+It exists to break a dependency cycle, and this is not obvious until Terraform rejects your config:
+
+- The MySQL Lambda's `default` env var contains the **RDS endpoint** → connector depends on datastore.
+- The RDS security group's ingress rule references the **Lambda's security group** → datastore depends on connector.
+
+Owning both security groups in a third module that depends on nothing makes the graph acyclic. The actual module graph, from `tofu graph`:
+
+```
+tenant-network ──> tenant-datastores ──> athena-connector ──> tenant-access
+       └────────────────────────────────────────┘
+```
+
+All modules and both environments were run through `tofu validate` (OpenTofu — Terraform's open-source fork; same HCL, same providers) against the real `hashicorp/aws` v5 provider schema, so the resource arguments here aren't guessed. Everywhere this doc says `terraform`, `tofu` works identically.
 
 ---
 
@@ -75,29 +92,31 @@ All four `.tf` root/module trees were run through `tofu validate` (OpenTofu — 
 
 ---
 
-## Phase 1: Deploy the shared stack (once)
+## Phase 1: Deploy the shared environment (once)
 
 ```bash
-cd multi-tenant-iac/shared
+cd multi-tenant-iac/environments/shared
 terraform init
 terraform plan
 terraform apply
 ```
 
-This creates: the code/spill/results S3 buckets, both connector jars uploaded into the code bucket, the S3 Gateway + Secrets Manager Interface VPC endpoints, the shared RDS subnet group, and the shared DynamoDB connector Lambda + its `tenant_*`-scoped IAM role + its Athena Data Catalog. Nothing tenant-specific exists yet.
+This instantiates `connector-artifacts` (the three S3 buckets, plus both connector jars fetched from the GitHub release and uploaded), `federation-network` (the S3 Gateway + Secrets Manager Interface VPC endpoints and the shared RDS subnet group), and `athena-connector` in its DynamoDB flavor (Lambda, IAM role scoped to `tenant_*` tables, Athena Data Catalog). Nothing tenant-specific exists yet.
 
 ```bash
 terraform output
 ```
 
-Keep this output around — every tenant config reads it via `terraform_remote_state`, pointed at `../../shared/terraform.tfstate` by default.
+Every tenant environment reads this state via `terraform_remote_state`, pointed at `../shared/terraform.tfstate` by default.
 
 ---
 
 ## Phase 2: Onboard your first tenant
 
+Copy the tenant environment — this is the whole onboarding mechanism:
+
 ```bash
-cp -r multi-tenant-iac/environments/example-tenant multi-tenant-iac/environments/acme
+cp -r multi-tenant-iac/environments/tenant-1 multi-tenant-iac/environments/acme
 cd multi-tenant-iac/environments/acme
 cp terraform.tfvars.example terraform.tfvars
 ```
@@ -146,24 +165,18 @@ aws dynamodb put-item --table-name "$TABLE" --item '{
 
 Same temporary-access pattern as the single-tenant doc: this tenant's RDS instance is private by default, so briefly open it to your own IP, seed it, then close it again.
 
-```bash
-TENANT_ID="acme"   # must match the tenant_id you set in terraform.tfvars for this environment
+Everything below comes from Terraform outputs — nothing is derived from a naming convention, so this works unchanged for any tenant id.
 
+```bash
 RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
+RDS_INSTANCE_ID=$(terraform output -raw rds_instance_id)
+RDS_SG_ID=$(terraform output -raw rds_security_group_id)
 SECRET_NAME=$(terraform output -raw mysql_secret_name)
 DB_NAME=$(terraform output -raw mysql_database_name)
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 
 MYSQL_PASSWORD=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text | jq -r .password)
 MYSQL_USERNAME=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text | jq -r .username)
-
-RDS_INSTANCE_ID="athena-fed-tenant-${TENANT_ID}-mysql"
-
-# This tenant's RDS security group ID — Terraform doesn't output it by default,
-# look it up by the fixed naming convention modules/tenant uses:
-RDS_SG_ID=$(aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=athena-fed-tenant-${TENANT_ID}-rds-sg" \
-  --query 'SecurityGroups[0].GroupId' --output text)
 
 aws ec2 authorize-security-group-ingress --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --cidr "${MY_IP}/32"
 aws rds modify-db-instance --db-instance-identifier "$RDS_INSTANCE_ID" --publicly-accessible --apply-immediately
@@ -249,7 +262,7 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 Repeat Phase 2 exactly, with a different id:
 
 ```bash
-cp -r multi-tenant-iac/environments/example-tenant multi-tenant-iac/environments/globex
+cp -r multi-tenant-iac/environments/tenant-1 multi-tenant-iac/environments/globex
 cd multi-tenant-iac/environments/globex
 cp terraform.tfvars.example terraform.tfvars
 # edit terraform.tfvars: tenant_id = "globex"
@@ -268,7 +281,7 @@ Destroy tenants first (any order, they don't depend on each other), shared last 
 ```bash
 cd multi-tenant-iac/environments/acme && terraform destroy
 cd ../globex && terraform destroy
-cd ../../shared && terraform destroy
+cd ../shared  && terraform destroy
 ```
 
 If a tenant's RDS instance is still flagged `publicly-accessible` from an interrupted Phase 3 (you skipped the revert step), `terraform destroy` will still delete it fine — the temporary security-group rule just gets deleted along with the security group itself.

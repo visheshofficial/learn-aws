@@ -12,8 +12,7 @@ terraform {
     }
   }
 
-  # Same reasoning as shared/versions.tf — local backend, one state file per
-  # tenant directory. Swap to "s3" (with a per-tenant key) for production.
+  # One state file per tenant directory — this is what makes tenants independent.
   backend "local" {
     path = "terraform.tfstate"
   }
